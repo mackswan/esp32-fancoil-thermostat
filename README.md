@@ -50,10 +50,6 @@ I have a seasonal 2-pipe 120V fan coil system and wanted something smarter than 
 ### Internal Assembly with Wiring Layout
 ![Bench Layout](thermostat-internal-esp32_unmounted.JPG)
 
-## Internal Component Layout
-![Internal layout](thermostat-premounting_layout.jpg)
-(Esp32 and the mounting extender were rotated left 90° in final layout)
-
 Includes:
 - 120V-AC 5V-DC fan coil relay switching
 - 5V power supply (see BOM.md)
@@ -75,6 +71,9 @@ Includes:
 
 ### Internal Component Layout
 ![Internal layout diagram](thermostat-internal-diagram.png)
+
+![Internal layout](thermostat-premounting_layout.jpg)
+(Esp32 and the mounting extender were rotated left 90° in final layout)
 
 
 ## Architecture
