@@ -51,6 +51,13 @@ I have a seasonal 2-pipe 120V fan coil system and wanted something smarter than 
 ## Internal Component Layout
 ![Internal layout](thermostat-premounting_layout.jpg)
 
+## Display Features
+
+- Custom OLED UI
+- Ambient dimming
+- Multi-screen rotary menu
+- Hand-crafted pixel weather sprites
+
 ## Architecture
 
 Room temp → control loop → relay output
