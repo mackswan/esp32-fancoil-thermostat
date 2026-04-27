@@ -60,6 +60,17 @@ I have a seasonal 2-pipe 120V fan coil system and wanted something smarter than 
 - Multi-screen rotary menu
 - Hand-crafted pixel weather sprites
 
+Complete wiring documentation:
+- [PDF schematic](./thermostat-wiring-schematic.pdf)
+- [SVG schematic](./thermostat-wiring-schematic.svg)
+
+Includes:
+- 120V-AC 5V-DC fan coil relay switching
+- 5V power supply (see BOM.md)
+- ESP32-S3 pin mapping
+- Sensor and OLED connections
+- Terminal distribution layout reservations
+
 ## Architecture
 
 Room temp → control loop → relay output
