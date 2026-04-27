@@ -46,11 +46,7 @@ I have a seasonal 2-pipe 120V fan coil system and wanted something smarter than 
 
 ### Internal Assembly with Wiring Layout
 
-![Internal layout](thermostat-internal-esp32_unmounted.JPG)
-
-### Pre-Mount Wiring Layout
-
-![Bench layout](thermostat-premounting_layout.jpg)
+![Bench Layout](thermostat-internal-esp32_unmounted.JPG)
 
 ## Internal Component Layout
 ![Internal layout](thermostat-premounting_layout.jpg)
