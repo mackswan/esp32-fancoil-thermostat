@@ -2,6 +2,12 @@
 
 A DIY wall-mounted thermostat built around an ESP32-S3 for controlling a 120V fan coil system, designed with local-first control, physical UI, and Home Assistant integration.
 
+## Documentation
+
+- [Bill of Materials](./BOM.md)
+- [ESPHome reference configuration](./thermostat_reference.yaml)
+- [Custom SSD1309 helper](./my_ssd1309.h)
+
 ## Features
 
 - Local thermostat control loop (not cloud dependent)
@@ -33,24 +39,20 @@ I have a seasonal 2-pipe 120V fan coil system and wanted something smarter than 
 ## Project Photos
 
 ### Finished Installed Thermostat
-
 ![Installed thermostat](thermostat-installed-front.jpg)
 
 ### Main Runtime Display
-
 ![Display UI](thermostat-display.jpg)
 
 ### Mode Selection Interface
-
 ![Mode UI](thermostat-installed-mode_set.jpg)
 
 ### Internal Assembly with Wiring Layout
-
 ![Bench Layout](thermostat-internal-esp32_unmounted.JPG)
 
 ## Internal Component Layout
 ![Internal layout](thermostat-premounting_layout.jpg)
-
+(Esp32 and the mounting extender were rotated left 90° in final layout)
 ## Display Features
 
 - Custom OLED UI
