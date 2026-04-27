@@ -88,6 +88,29 @@ Room temp -> control loop -> relay output
 Home Assistant (weather + optional setpoint)
 ```
 
+## Home Assistant / HomeKit Climate Adapter
+
+A standard thermostat climate entity does not map cleanly to a two-pipe fan coil system where heating or cooling is determined by the building and not selected by the user.  
+
+The thermostat itself only controls whether the fan coil relay is energized, so this project includes a small Pyscript-based climate adapter to make the system behave correctly in Home Assistant and HomeKit:
+
+- [Pyscript climate adapter](./thermostat_climate.py)
+
+Rather than treating Heat/Cool as a direct command, the adapter infers the effective HVAC state from:
+
+- selected seasonal mode
+- room temperature
+- setpoint
+- relay state
+
+For example:
+
+```text
+relay on + room temp above setpoint -> cooling
+relay on + room temp below setpoint -> heating
+relay off -> idle/off
+```
+
 ## Future Ideas
 
 - PID mode experimentation
