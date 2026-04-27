@@ -18,6 +18,7 @@ A DIY wall-mounted thermostat built around an ESP32-S3 for controlling a 120V fa
 - IR transmit/receive support
 - Photo sensor-driven display/button dimming
 - Home Assistant integration (setpoint + weather)
+- Custom pixel weather sprites
 - Standalone operation if HA is unavailable
 
 ## Hardware
@@ -77,17 +78,20 @@ Includes:
 
 
 ## Architecture
-
-Room temp → control loop → relay output
-             ↓
+```text
+Room temp -> control loop -> relay output
+             |
+             v
        OLED + local UI
-             ↓
- Home Assistant (weather + optional setpoint)
+             |
+             v
+Home Assistant (weather + optional setpoint)
+```
 
 ## Future Ideas
 
 - PID mode experimentation
-- Matter variant?
+- Optional Matter firmware variant
 - Expanded HVAC modes
 - More polished enclosure revisions
 
