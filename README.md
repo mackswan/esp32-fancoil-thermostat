@@ -30,9 +30,30 @@ A DIY wall-mounted thermostat built around an ESP32-S3 for controlling a 120V fa
 
 I have a seasonal 2-pipe 120V fan coil system and wanted something smarter than a conventional thermostat, while keeping control local and hackable.
 
-## Photos
+## Project Photos
 
-(Add project photos here)
+### Finished Installed Thermostat
+
+![Installed thermostat](thermostat-installed-front.jpg)
+
+### Main Runtime Display
+
+![Display UI](thermostat-display.jpg)
+
+### Mode Selection Interface
+
+![Mode UI](thermostat-installed-mode_set.jpg)
+
+### Internal Assembly with Wiring Layout
+
+![Internal layout](thermostat-internal-esp32_unmounted.JPG)
+
+### Pre-Mount Wiring Layout
+
+![Bench layout](thermostat-premounting_layout.jpg)
+
+## Internal Component Layout
+![Internal layout](thermostat-premounting_layout.jpg)
 
 ## Architecture
 
