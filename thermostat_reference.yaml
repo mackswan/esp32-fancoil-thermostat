@@ -1,0 +1,877 @@
+# ESPHome reference configuration for the Custom ESP32-S3 Fan Coil Thermostat
+#
+# This file is based on the live project configuration, with secrets removed.
+# It intentionally preserves the real pin map, local thermostat logic, OLED UI,
+# encoder behavior, relay control, dimming logic, and Home Assistant integration.
+#
+# Required companion files:
+# - my_ssd1309.h   (custom SSD1309 dimming helper)
+# - Logisoso.ttf   (font used by the OLED UI)
+#
+# Store Wi-Fi/API/OTA credentials in secrets.yaml, not in this file.
+
+esphome:
+  name: thermostat
+  # friendly_name: "Thermostat"  # Set this to your brand/device name if desired
+  includes:
+    - my_ssd1309.h
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+
+button:
+  - platform: restart
+    name: "Restart"
+
+output:
+  - platform: ledc
+    pin: GPIO11
+    id: piezo_out
+    frequency: 4000Hz
+
+rtttl:
+  output: piezo_out
+  id: piezo
+
+
+# ── PINOUT ─────────────────────────────────────────────────────
+# GP1  Relay IN
+# GP2  OLED CS
+# GP3  OLED DC
+# GP4  OLED RES
+# GP5  OLED SDA (MOSI)
+# GP6  OLED SCK
+# GP7  Encoder CLK
+# GP8  Encoder DT
+# GP9  Encoder SW
+# GP10 KY-018 Photosensor (ADC)
+# GP11 Piezo Buzzer (IR TX moved to dedicated blaster — V2)
+# GP12 SHTC3 SDA
+# GP13 SHTC3 SCL
+# GP43 Free (UART TX — avoid for audio, use for future expansion)
+
+# ── I2C ────────────────────────────────────────────────────────
+i2c:
+  sda: GPIO12
+  scl: GPIO13
+  scan: true
+  frequency: 100kHz
+  timeout: 50ms
+
+# ── SPI (OLED) ─────────────────────────────────────────────────
+spi:
+  clk_pin: GPIO6
+  mosi_pin: GPIO5
+
+# ── SENSORS ────────────────────────────────────────────────────
+sensor:
+  - platform: shtcx
+    temperature:
+      name: "Indoor Temperature"
+      id: indoor_temp
+      filters:
+        - offset: -0.833  # -1.5°F correction for sensor height
+    humidity:
+      name: "Indoor Humidity"
+      id: indoor_humidity
+    update_interval: 10s
+
+  - platform: rotary_encoder
+    name: "Setpoint Encoder"
+    id: setpoint_encoder
+    internal: true
+    pin_a: GPIO7
+    pin_b: GPIO8
+    resolution: 1
+    min_value: 60
+    max_value: 85
+    publish_initial_value: true
+    on_value:
+      then:
+        - lambda: |-
+            if (id(in_mode_selector)) {
+              float delta = x - id(last_encoder_val);
+              id(last_encoder_val) = x;
+              if (delta == 0) return;
+              int sel = id(mode_selector_selection);
+              if (delta > 0) {
+                // clockwise: HEAT→OFF→COOL, stop at COOL
+                if (sel == 0) sel = 2;
+                else if (sel == 2) sel = 1;
+                // already at COOL (1), stay there
+              } else {
+                // counter-clockwise: COOL→OFF→HEAT, stop at HEAT
+                if (sel == 1) sel = 2;
+                else if (sel == 2) sel = 0;
+                // already at HEAT (0), stay there
+              }
+              id(mode_selector_selection) = sel;
+              id(mode_selector_ms) = millis();
+            } else {
+              // Setpoint adjustment
+              id(last_encoder_val) = x;
+              id(setpoint_f) = x;
+              id(last_adjust_ms) = millis();  // reset timeout every detent
+              if (!isnan(id(indoor_temp).state)) {
+                float temp_f = (id(indoor_temp).state * 9.0 / 5.0) + 32.0;
+                float setpt  = id(setpoint_f);
+                int   mode   = id(hvac_mode);
+                float deadband = 1.0;
+                if (mode == 0) {
+                  if (temp_f < setpt - deadband) id(fcu_relay).turn_on();
+                  if (temp_f > setpt + deadband) id(fcu_relay).turn_off();
+                } else if (mode == 1) {
+                  if (temp_f > setpt + deadband) id(fcu_relay).turn_on();
+                  if (temp_f < setpt - deadband) id(fcu_relay).turn_off();
+                } else {
+                  id(fcu_relay).turn_off();
+                }
+              }
+            }
+
+  # ── LIGHT SENSOR KY-018 (GP10) ──────────────────────────────────
+  - platform: adc
+    pin: GPIO10
+    name: "Light Level"
+    id: light_level
+    update_interval: 5s
+    attenuation: 12db
+    filters:
+      - lambda: return x / 3.3 * 100.0;
+      - clamp:
+          min_value: 0
+          max_value: 100
+      - sliding_window_moving_average:
+          window_size: 3
+          send_every: 1
+    on_value:
+      - lambda: |-
+          // KY-018 inverse: high reading = dark room, low reading = bright room
+          // 255 sentinel forces ssd1309_set_dim on first real reading
+          static uint8_t current_level = 255;  // uninitialized — forces first update
+
+          uint8_t new_level;
+          if      (x > 80.0f) new_level = 0;  // dark room
+          else if (x > 55.0f) new_level = 1;  // dim
+          else if (x > 30.0f) new_level = 2;  // medium
+          else                 new_level = 3;  // bright room
+
+          if (new_level != current_level) {
+            ESP_LOGD("dim", "Light %.1f%% -> dim level %d", x, new_level);
+            current_level = new_level;
+            id(dim_level) = new_level;
+            ssd1309_set_dim(id(oled_display), current_level);
+          }
+
+  # ── HA WEATHER SENSORS ─────────────────────────────────────────
+  - platform: homeassistant
+    id: outside_temp_f
+    entity_id: weather.forecast_home
+    attribute: temperature
+
+  - platform: homeassistant
+    id: outside_dewpt_f
+    entity_id: weather.forecast_home
+    attribute: dew_point
+
+  - platform: homeassistant
+    id: outside_humidity
+    entity_id: weather.forecast_home
+    attribute: humidity
+
+# ── WEATHER CONDITION ──────────────────────────────────────────
+text_sensor:
+  - platform: homeassistant
+    id: wx_condition
+    entity_id: weather.forecast_home
+
+  - platform: homeassistant
+    id: sun_state
+    entity_id: sun.sun
+
+# ── ENCODER BUTTON ─────────────────────────────────────────────
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO9
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Encoder Button"
+    id: encoder_button
+    internal: true
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - rtttl.play:
+            rtttl: "chirp:d=16,o=6,b=180:e"
+        - lambda: |-
+            if (id(in_mode_selector)) {
+              id(hvac_mode) = id(mode_selector_selection);
+              id(in_mode_selector) = false;
+              id(last_encoder_val) = id(setpoint_f);
+              id(last_adjust_ms) = 0;  // clear adjusting state
+              if (!isnan(id(indoor_temp).state)) {
+                float temp_f = (id(indoor_temp).state * 9.0 / 5.0) + 32.0;
+                float setpt  = id(setpoint_f);
+                int   mode   = id(hvac_mode);
+                float deadband = 1.0;
+                if (mode == 0) {
+                  if (temp_f < setpt - deadband) id(fcu_relay).turn_on();
+                  if (temp_f > setpt + deadband) id(fcu_relay).turn_off();
+                } else if (mode == 1) {
+                  if (temp_f > setpt + deadband) id(fcu_relay).turn_on();
+                  if (temp_f < setpt - deadband) id(fcu_relay).turn_off();
+                } else {
+                  id(fcu_relay).turn_off();
+                }
+              }
+            } else {
+              // Enter mode selector — also clears adjusting state
+              id(in_mode_selector) = true;
+              id(mode_selector_selection) = id(hvac_mode);
+              id(mode_selector_ms) = millis();
+              id(last_adjust_ms) = 0;  // clear adjusting state
+            }
+
+# ── RELAY (GP1) ────────────────────────────────────────────────
+switch:
+  - platform: gpio
+    pin: GPIO1
+    name: "FCU Relay"
+    id: fcu_relay
+    restore_mode: RESTORE_DEFAULT_OFF
+
+
+# ── IR TRANSMITTER (V2 — dedicated blaster, not on thermostat) ──
+# remote_transmitter:
+#   pin: GPIO11  # now used for piezo
+#   carrier_duty_percent: 50%
+#   rmt_symbols: 192
+
+# ── GLOBALS ────────────────────────────────────────────────────
+globals:
+  - id: dim_level
+    type: int
+    restore_value: false
+    initial_value: '3'
+
+  - id: hvac_mode
+    type: int
+    restore_value: false
+    initial_value: '2'    # 0=HEAT 1=COOL 2=OFF — boots to OFF
+
+  - id: setpoint_f
+    type: float
+    restore_value: false
+    initial_value: '72.0'
+
+  - id: last_adjust_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: in_mode_selector
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: mode_selector_selection
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: mode_selector_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: last_encoder_val
+    type: float
+    restore_value: false
+    initial_value: '72.0'
+
+# ── OLED DISPLAY ───────────────────────────────────────────────
+font:
+  - file: "Logisoso.ttf"
+    id: font_large
+    size: 46
+    glyphs: "0123456789-"
+
+  - file: "gfonts://Press Start 2P"
+    id: font_medium
+    size: 8
+    glyphs: "0123456789%-"
+
+  - file: "gfonts://Silkscreen"
+    id: font_label
+    size: 8
+    glyphs: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .%-"
+
+  - file: "Logisoso.ttf"
+    id: font_mode
+    size: 20
+    glyphs: "HEATCOLFSU"
+
+display:
+  - platform: ssd1306_spi
+    id: oled_display
+    model: "SSD1306_128X64"
+    cs_pin: GPIO2
+    dc_pin:
+      number: GPIO3
+      ignore_strapping_warning: true
+    reset_pin: GPIO4
+    rotation: 180
+    external_vcc: false
+    brightness: 1.0
+    data_rate: 500kHz
+    spi_mode: MODE0
+    flip_x: false
+    flip_y: false
+    update_interval: 500ms
+    lambda: |-
+
+      // ── MODE SELECTOR SCREEN ─────────────────────────────────
+      if (id(in_mode_selector)) {
+        if (millis() - id(mode_selector_ms) > 8000) {
+          id(in_mode_selector) = false;
+          id(last_encoder_val) = id(setpoint_f);
+          id(last_adjust_ms) = 0;
+        } else {
+          int sel = id(mode_selector_selection);
+          it.print(64, 0, id(font_label), TextAlign::TOP_CENTER, "Set Mode");
+          int centers[3] = {21, 64, 107};
+          const char* labels[3] = {"HEAT", "OFF", "COOL"};
+          int sel_pos = (sel == 0) ? 0 : (sel == 2) ? 1 : 2;
+          for (int i = 0; i < 3; i++) {
+            if (i == sel_pos) {
+              it.filled_rectangle(centers[i] - 20, 14, 40, 20);
+              it.draw_pixel_at(centers[i]-20, 14, COLOR_OFF);
+              it.draw_pixel_at(centers[i]-19, 14, COLOR_OFF);
+              it.draw_pixel_at(centers[i]-20, 15, COLOR_OFF);
+              it.draw_pixel_at(centers[i]+19, 14, COLOR_OFF);
+              it.draw_pixel_at(centers[i]+18, 14, COLOR_OFF);
+              it.draw_pixel_at(centers[i]+19, 15, COLOR_OFF);
+              it.draw_pixel_at(centers[i]-20, 33, COLOR_OFF);
+              it.draw_pixel_at(centers[i]-19, 33, COLOR_OFF);
+              it.draw_pixel_at(centers[i]-20, 32, COLOR_OFF);
+              it.draw_pixel_at(centers[i]+19, 33, COLOR_OFF);
+              it.draw_pixel_at(centers[i]+18, 33, COLOR_OFF);
+              it.draw_pixel_at(centers[i]+19, 32, COLOR_OFF);
+              it.print(centers[i], 15, id(font_mode), COLOR_OFF, TextAlign::TOP_CENTER, labels[i]);
+            } else {
+              it.print(centers[i], 15, id(font_mode), TextAlign::TOP_CENTER, labels[i]);
+            }
+          }
+          int chev_x = centers[sel_pos];
+          it.horizontal_line(0, 40, chev_x - 5);
+          it.line(chev_x - 4, 40, chev_x, 36);
+          it.line(chev_x + 4, 40, chev_x, 36);
+          it.horizontal_line(chev_x + 5, 40, 127 - chev_x - 5);
+          it.print(64, 50, id(font_label), TextAlign::TOP_CENTER, "Turn - Press to Confirm");
+          return;
+        }
+      }
+
+      // ── IS ADJUSTING — checked from last_adjust_ms directly ──
+      // Using millis() comparison avoids stale bool state
+      bool adjusting = (id(last_adjust_ms) > 0) &&
+                       (millis() - id(last_adjust_ms) < 3000);
+
+      // ── CONVERSIONS ──────────────────────────────────────────
+      bool indoor_valid = !isnan(id(indoor_temp).state) && !isnan(id(indoor_humidity).state);
+      int indoor_f = indoor_valid ? (int)((id(indoor_temp).state * 9.0 / 5.0) + 32.0) : 0;
+      int humid    = indoor_valid ? (int)id(indoor_humidity).state : 0;
+      int target   = (int)id(setpoint_f);
+      bool outside_valid = !isnan(id(outside_temp_f).state);
+      int outside = outside_valid ? (int)id(outside_temp_f).state : 38;
+      int dewpt   = outside_valid ? (int)id(outside_dewpt_f).state : 54;
+      int mode    = id(hvac_mode);
+
+      // ── WEATHER ICON ─────────────────────────────────────────
+      std::string wx = id(wx_condition).state;
+      bool is_night = (id(sun_state).state == "below_horizon");
+
+      if (wx == "sunny") {
+        // Sunny — pixel map by Evan Cash
+        it.draw_pixel_at(7, 0);
+        it.draw_pixel_at(1, 1); it.draw_pixel_at(7, 1); it.draw_pixel_at(13, 1);
+        it.draw_pixel_at(2, 2); it.draw_pixel_at(12, 2);
+        it.draw_pixel_at(6, 3); it.draw_pixel_at(7, 3); it.draw_pixel_at(8, 3);
+        it.draw_pixel_at(4, 4); it.draw_pixel_at(5, 4); it.draw_pixel_at(9, 4); it.draw_pixel_at(10, 4);
+        it.draw_pixel_at(4, 5); it.draw_pixel_at(10, 5);
+        it.draw_pixel_at(3, 6); it.draw_pixel_at(11, 6);
+        it.draw_pixel_at(0, 7); it.draw_pixel_at(1, 7); it.draw_pixel_at(3, 7); it.draw_pixel_at(11, 7); it.draw_pixel_at(13, 7); it.draw_pixel_at(14, 7);
+        it.draw_pixel_at(3, 8); it.draw_pixel_at(11, 8);
+        it.draw_pixel_at(4, 9); it.draw_pixel_at(10, 9);
+        it.draw_pixel_at(4, 10); it.draw_pixel_at(5, 10); it.draw_pixel_at(9, 10); it.draw_pixel_at(10, 10);
+        it.draw_pixel_at(6, 11); it.draw_pixel_at(7, 11); it.draw_pixel_at(8, 11);
+        it.draw_pixel_at(2, 12); it.draw_pixel_at(12, 12);
+        it.draw_pixel_at(1, 13); it.draw_pixel_at(7, 13); it.draw_pixel_at(13, 13);
+        it.draw_pixel_at(7, 14);
+      } else if (wx == "clear-night") {
+        // Clear Night — pixel map by Evan Cash
+        it.draw_pixel_at(5, 0); it.draw_pixel_at(6, 0);
+        it.draw_pixel_at(3, 1); it.draw_pixel_at(4, 1); it.draw_pixel_at(5, 1); it.draw_pixel_at(10, 1);
+        it.draw_pixel_at(2, 2); it.draw_pixel_at(5, 2); it.draw_pixel_at(9, 2); it.draw_pixel_at(10, 2); it.draw_pixel_at(11, 2);
+        it.draw_pixel_at(1, 3); it.draw_pixel_at(2, 3); it.draw_pixel_at(5, 3); it.draw_pixel_at(8, 3); it.draw_pixel_at(9, 3); it.draw_pixel_at(11, 3); it.draw_pixel_at(12, 3);
+        it.draw_pixel_at(1, 4); it.draw_pixel_at(4, 4); it.draw_pixel_at(9, 4); it.draw_pixel_at(10, 4); it.draw_pixel_at(11, 4); it.draw_pixel_at(14, 4);
+        it.draw_pixel_at(1, 5); it.draw_pixel_at(4, 5); it.draw_pixel_at(10, 5); it.draw_pixel_at(13, 5); it.draw_pixel_at(14, 5); it.draw_pixel_at(15, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(4, 6); it.draw_pixel_at(12, 6); it.draw_pixel_at(13, 6); it.draw_pixel_at(15, 6); it.draw_pixel_at(16, 6);
+        it.draw_pixel_at(0, 7); it.draw_pixel_at(5, 7); it.draw_pixel_at(13, 7); it.draw_pixel_at(14, 7); it.draw_pixel_at(15, 7);
+        it.draw_pixel_at(1, 8); it.draw_pixel_at(5, 8); it.draw_pixel_at(14, 8);
+        it.draw_pixel_at(1, 9); it.draw_pixel_at(6, 9);
+        it.draw_pixel_at(2, 10); it.draw_pixel_at(7, 10); it.draw_pixel_at(8, 10);
+        it.draw_pixel_at(2, 11); it.draw_pixel_at(9, 11); it.draw_pixel_at(10, 11); it.draw_pixel_at(11, 11); it.draw_pixel_at(12, 11);
+        it.draw_pixel_at(3, 12); it.draw_pixel_at(4, 12); it.draw_pixel_at(10, 12); it.draw_pixel_at(11, 12);
+        it.draw_pixel_at(5, 13); it.draw_pixel_at(6, 13); it.draw_pixel_at(7, 13); it.draw_pixel_at(8, 13); it.draw_pixel_at(9, 13);
+      } else if (wx == "partlycloudy") {
+        // Mostly-Partly Sunny — pixel map by Evan Cash
+        it.draw_pixel_at(7, 0);
+        it.draw_pixel_at(1, 1); it.draw_pixel_at(7, 1); it.draw_pixel_at(13, 1);
+        it.draw_pixel_at(2, 2); it.draw_pixel_at(12, 2);
+        it.draw_pixel_at(6, 3); it.draw_pixel_at(7, 3); it.draw_pixel_at(8, 3);
+        it.draw_pixel_at(4, 4); it.draw_pixel_at(5, 4); it.draw_pixel_at(9, 4); it.draw_pixel_at(10, 4);
+        it.draw_pixel_at(4, 5); it.draw_pixel_at(10, 5);
+        it.draw_pixel_at(3, 6); it.draw_pixel_at(11, 6); it.draw_pixel_at(12, 6); it.draw_pixel_at(13, 6);
+        it.draw_pixel_at(0, 7); it.draw_pixel_at(1, 7); it.draw_pixel_at(3, 7); it.draw_pixel_at(11, 7); it.draw_pixel_at(14, 7); it.draw_pixel_at(15, 7);
+        it.draw_pixel_at(3, 8); it.draw_pixel_at(9, 8); it.draw_pixel_at(10, 8); it.draw_pixel_at(16, 8);
+        it.draw_pixel_at(4, 9); it.draw_pixel_at(8, 9); it.draw_pixel_at(16, 9);
+        it.draw_pixel_at(4, 10); it.draw_pixel_at(5, 10); it.draw_pixel_at(7, 10); it.draw_pixel_at(15, 10); it.draw_pixel_at(17, 10);
+        it.draw_pixel_at(6, 11); it.draw_pixel_at(18, 11);
+        it.draw_pixel_at(2, 12); it.draw_pixel_at(6, 12); it.draw_pixel_at(18, 12);
+        it.draw_pixel_at(1, 13); it.draw_pixel_at(7, 13); it.draw_pixel_at(18, 13);
+        it.draw_pixel_at(8, 14); it.draw_pixel_at(17, 14);
+        it.draw_pixel_at(9, 15); it.draw_pixel_at(10, 15); it.draw_pixel_at(11, 15); it.draw_pixel_at(12, 15); it.draw_pixel_at(13, 15); it.draw_pixel_at(14, 15); it.draw_pixel_at(15, 15); it.draw_pixel_at(16, 15);
+      } else if (wx == "cloudy") {
+        if (is_night) {
+          // Cloudy Night — pixel map by Evan Cash
+          it.draw_pixel_at(11, 0); it.draw_pixel_at(12, 0);
+          it.draw_pixel_at(10, 1); it.draw_pixel_at(11, 1);
+          it.draw_pixel_at(9, 2); it.draw_pixel_at(11, 2);
+          it.draw_pixel_at(8, 3); it.draw_pixel_at(12, 3);
+          it.draw_pixel_at(8, 4); it.draw_pixel_at(12, 4);
+          it.draw_pixel_at(4, 5); it.draw_pixel_at(5, 5); it.draw_pixel_at(6, 5); it.draw_pixel_at(7, 5); it.draw_pixel_at(8, 5); it.draw_pixel_at(9, 5); it.draw_pixel_at(13, 5);
+          it.draw_pixel_at(3, 6); it.draw_pixel_at(4, 6); it.draw_pixel_at(9, 6); it.draw_pixel_at(10, 6); it.draw_pixel_at(14, 6); it.draw_pixel_at(15, 6); it.draw_pixel_at(18, 6);
+          it.draw_pixel_at(2, 7); it.draw_pixel_at(11, 7); it.draw_pixel_at(16, 7); it.draw_pixel_at(17, 7); it.draw_pixel_at(18, 7);
+          it.draw_pixel_at(2, 8); it.draw_pixel_at(10, 8); it.draw_pixel_at(11, 8); it.draw_pixel_at(12, 8); it.draw_pixel_at(13, 8); it.draw_pixel_at(14, 8); it.draw_pixel_at(17, 8);
+          it.draw_pixel_at(1, 9); it.draw_pixel_at(9, 9); it.draw_pixel_at(14, 9); it.draw_pixel_at(15, 9); it.draw_pixel_at(16, 9);
+          it.draw_pixel_at(0, 10); it.draw_pixel_at(15, 10);
+          it.draw_pixel_at(0, 11); it.draw_pixel_at(15, 11);
+          it.draw_pixel_at(0, 12); it.draw_pixel_at(15, 12);
+          it.draw_pixel_at(1, 13); it.draw_pixel_at(14, 13);
+          it.draw_pixel_at(2, 14); it.draw_pixel_at(3, 14); it.draw_pixel_at(4, 14); it.draw_pixel_at(5, 14); it.draw_pixel_at(6, 14); it.draw_pixel_at(7, 14); it.draw_pixel_at(8, 14); it.draw_pixel_at(9, 14); it.draw_pixel_at(10, 14); it.draw_pixel_at(11, 14); it.draw_pixel_at(12, 14); it.draw_pixel_at(13, 14);
+        } else {
+          // Cloudy — pixel map by Evan Cash
+          it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0); it.draw_pixel_at(9, 0); it.draw_pixel_at(10, 0);
+          it.draw_pixel_at(4, 1); it.draw_pixel_at(5, 1); it.draw_pixel_at(11, 1);
+          it.draw_pixel_at(3, 2); it.draw_pixel_at(12, 2);
+          it.draw_pixel_at(2, 3); it.draw_pixel_at(12, 3); it.draw_pixel_at(13, 3); it.draw_pixel_at(14, 3); it.draw_pixel_at(15, 3);
+          it.draw_pixel_at(2, 4); it.draw_pixel_at(11, 4); it.draw_pixel_at(12, 4); it.draw_pixel_at(16, 4);
+          it.draw_pixel_at(1, 5); it.draw_pixel_at(2, 5); it.draw_pixel_at(11, 5); it.draw_pixel_at(17, 5);
+          it.draw_pixel_at(0, 6); it.draw_pixel_at(3, 6); it.draw_pixel_at(10, 6); it.draw_pixel_at(18, 6);
+          it.draw_pixel_at(0, 7); it.draw_pixel_at(18, 7);
+          it.draw_pixel_at(0, 8); it.draw_pixel_at(17, 8);
+          it.draw_pixel_at(1, 9); it.draw_pixel_at(16, 9);
+          it.draw_pixel_at(1, 10); it.draw_pixel_at(16, 10);
+          it.draw_pixel_at(2, 11); it.draw_pixel_at(3, 11); it.draw_pixel_at(14, 11); it.draw_pixel_at(15, 11);
+          it.draw_pixel_at(4, 12); it.draw_pixel_at(5, 12); it.draw_pixel_at(6, 12); it.draw_pixel_at(7, 12); it.draw_pixel_at(8, 12); it.draw_pixel_at(9, 12); it.draw_pixel_at(10, 12); it.draw_pixel_at(11, 12); it.draw_pixel_at(12, 12); it.draw_pixel_at(13, 12);
+        }
+      } else if (wx == "rainy") {
+        // Rain — pixel map by Evan Cash
+        it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0);
+        it.draw_pixel_at(5, 1); it.draw_pixel_at(9, 1);
+        it.draw_pixel_at(3, 2); it.draw_pixel_at(4, 2); it.draw_pixel_at(10, 2);
+        it.draw_pixel_at(2, 3); it.draw_pixel_at(10, 3); it.draw_pixel_at(11, 3);
+        it.draw_pixel_at(1, 4); it.draw_pixel_at(9, 4); it.draw_pixel_at(12, 4);
+        it.draw_pixel_at(0, 5); it.draw_pixel_at(13, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(13, 6);
+        it.draw_pixel_at(1, 7); it.draw_pixel_at(12, 7); it.draw_pixel_at(13, 7);
+        it.draw_pixel_at(2, 8); it.draw_pixel_at(3, 8); it.draw_pixel_at(4, 8); it.draw_pixel_at(5, 8); it.draw_pixel_at(6, 8); it.draw_pixel_at(7, 8); it.draw_pixel_at(8, 8); it.draw_pixel_at(9, 8); it.draw_pixel_at(10, 8); it.draw_pixel_at(11, 8);
+        it.draw_pixel_at(3, 10); it.draw_pixel_at(7, 10); it.draw_pixel_at(11, 10);
+        it.draw_pixel_at(5, 12); it.draw_pixel_at(9, 12);
+        it.draw_pixel_at(2, 13); it.draw_pixel_at(5, 13); it.draw_pixel_at(9, 13); it.draw_pixel_at(12, 13);
+        it.draw_pixel_at(7, 14);
+      } else if (wx == "pouring") {
+        // Heavy Rain — pixel map by Evan Cash
+        it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0);
+        it.draw_pixel_at(5, 1); it.draw_pixel_at(9, 1);
+        it.draw_pixel_at(3, 2); it.draw_pixel_at(4, 2); it.draw_pixel_at(10, 2);
+        it.draw_pixel_at(2, 3); it.draw_pixel_at(10, 3); it.draw_pixel_at(11, 3);
+        it.draw_pixel_at(1, 4); it.draw_pixel_at(9, 4); it.draw_pixel_at(12, 4);
+        it.draw_pixel_at(0, 5); it.draw_pixel_at(13, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(13, 6);
+        it.draw_pixel_at(1, 7); it.draw_pixel_at(12, 7); it.draw_pixel_at(13, 7);
+        it.draw_pixel_at(2, 8); it.draw_pixel_at(3, 8); it.draw_pixel_at(4, 8); it.draw_pixel_at(5, 8); it.draw_pixel_at(6, 8); it.draw_pixel_at(7, 8); it.draw_pixel_at(8, 8); it.draw_pixel_at(9, 8); it.draw_pixel_at(10, 8); it.draw_pixel_at(11, 8);
+        it.draw_pixel_at(3, 10); it.draw_pixel_at(7, 10); it.draw_pixel_at(11, 10);
+        it.draw_pixel_at(3, 11); it.draw_pixel_at(5, 11); it.draw_pixel_at(7, 11); it.draw_pixel_at(9, 11); it.draw_pixel_at(11, 11);
+        it.draw_pixel_at(3, 12); it.draw_pixel_at(7, 12); it.draw_pixel_at(11, 12);
+        it.draw_pixel_at(3, 13); it.draw_pixel_at(7, 13); it.draw_pixel_at(11, 13);
+        it.draw_pixel_at(5, 14); it.draw_pixel_at(9, 14);
+        it.draw_pixel_at(5, 15); it.draw_pixel_at(9, 15);
+      } else if (wx == "hail") {
+        // Hail — pixel map by Evan Cash
+        it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0); it.draw_pixel_at(9, 0);
+        it.draw_pixel_at(6, 1); it.draw_pixel_at(10, 1);
+        it.draw_pixel_at(4, 2); it.draw_pixel_at(5, 2); it.draw_pixel_at(11, 2);
+        it.draw_pixel_at(3, 3); it.draw_pixel_at(11, 3); it.draw_pixel_at(12, 3);
+        it.draw_pixel_at(2, 4); it.draw_pixel_at(10, 4); it.draw_pixel_at(13, 4);
+        it.draw_pixel_at(1, 5); it.draw_pixel_at(14, 5);
+        it.draw_pixel_at(1, 6); it.draw_pixel_at(14, 6);
+        it.draw_pixel_at(2, 7); it.draw_pixel_at(13, 7); it.draw_pixel_at(14, 7);
+        it.draw_pixel_at(3, 8); it.draw_pixel_at(4, 8); it.draw_pixel_at(5, 8); it.draw_pixel_at(6, 8); it.draw_pixel_at(7, 8); it.draw_pixel_at(8, 8); it.draw_pixel_at(9, 8); it.draw_pixel_at(10, 8); it.draw_pixel_at(11, 8); it.draw_pixel_at(12, 8);
+        it.draw_pixel_at(2, 10); it.draw_pixel_at(3, 10); it.draw_pixel_at(7, 10); it.draw_pixel_at(10, 10); it.draw_pixel_at(11, 10); it.draw_pixel_at(14, 10);
+        it.draw_pixel_at(2, 11); it.draw_pixel_at(3, 11); it.draw_pixel_at(6, 11); it.draw_pixel_at(10, 11); it.draw_pixel_at(11, 11); it.draw_pixel_at(13, 11);
+        it.draw_pixel_at(1, 13); it.draw_pixel_at(5, 13); it.draw_pixel_at(6, 13); it.draw_pixel_at(9, 13); it.draw_pixel_at(13, 13); it.draw_pixel_at(14, 13);
+        it.draw_pixel_at(0, 14); it.draw_pixel_at(5, 14); it.draw_pixel_at(6, 14); it.draw_pixel_at(8, 14); it.draw_pixel_at(13, 14); it.draw_pixel_at(14, 14);
+      } else if (wx == "snowy") {
+        // Snowy — pixel map by Evan Cash
+        it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0);
+        it.draw_pixel_at(5, 1); it.draw_pixel_at(9, 1);
+        it.draw_pixel_at(3, 2); it.draw_pixel_at(4, 2); it.draw_pixel_at(10, 2);
+        it.draw_pixel_at(2, 3); it.draw_pixel_at(10, 3); it.draw_pixel_at(11, 3);
+        it.draw_pixel_at(1, 4); it.draw_pixel_at(9, 4); it.draw_pixel_at(12, 4);
+        it.draw_pixel_at(0, 5); it.draw_pixel_at(13, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(13, 6);
+        it.draw_pixel_at(1, 7); it.draw_pixel_at(12, 7); it.draw_pixel_at(13, 7);
+        it.draw_pixel_at(2, 8); it.draw_pixel_at(3, 8); it.draw_pixel_at(4, 8); it.draw_pixel_at(5, 8); it.draw_pixel_at(6, 8); it.draw_pixel_at(7, 8); it.draw_pixel_at(8, 8); it.draw_pixel_at(9, 8); it.draw_pixel_at(10, 8); it.draw_pixel_at(11, 8);
+        it.draw_pixel_at(4, 10); it.draw_pixel_at(10, 10);
+        it.draw_pixel_at(3, 11); it.draw_pixel_at(5, 11); it.draw_pixel_at(9, 11); it.draw_pixel_at(11, 11);
+        it.draw_pixel_at(4, 12); it.draw_pixel_at(7, 12); it.draw_pixel_at(10, 12);
+        it.draw_pixel_at(1, 13); it.draw_pixel_at(6, 13); it.draw_pixel_at(8, 13); it.draw_pixel_at(13, 13);
+        it.draw_pixel_at(0, 14); it.draw_pixel_at(2, 14); it.draw_pixel_at(7, 14); it.draw_pixel_at(12, 14); it.draw_pixel_at(14, 14);
+        it.draw_pixel_at(1, 15); it.draw_pixel_at(13, 15);
+      } else if (wx == "snowy-rainy") {
+        // Snowy-Rainy — pixel map by Evan Cash
+        it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0);
+        it.draw_pixel_at(5, 1); it.draw_pixel_at(9, 1);
+        it.draw_pixel_at(3, 2); it.draw_pixel_at(4, 2); it.draw_pixel_at(10, 2);
+        it.draw_pixel_at(2, 3); it.draw_pixel_at(10, 3); it.draw_pixel_at(11, 3);
+        it.draw_pixel_at(1, 4); it.draw_pixel_at(9, 4); it.draw_pixel_at(12, 4);
+        it.draw_pixel_at(0, 5); it.draw_pixel_at(13, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(13, 6);
+        it.draw_pixel_at(1, 7); it.draw_pixel_at(12, 7); it.draw_pixel_at(13, 7);
+        it.draw_pixel_at(2, 8); it.draw_pixel_at(3, 8); it.draw_pixel_at(4, 8); it.draw_pixel_at(5, 8); it.draw_pixel_at(6, 8); it.draw_pixel_at(7, 8); it.draw_pixel_at(8, 8); it.draw_pixel_at(9, 8); it.draw_pixel_at(10, 8); it.draw_pixel_at(11, 8);
+        it.draw_pixel_at(0, 10); it.draw_pixel_at(5, 10); it.draw_pixel_at(8, 10); it.draw_pixel_at(13, 10);
+        it.draw_pixel_at(3, 11); it.draw_pixel_at(11, 11);
+        it.draw_pixel_at(2, 12); it.draw_pixel_at(4, 12); it.draw_pixel_at(10, 12); it.draw_pixel_at(12, 12);
+        it.draw_pixel_at(3, 13); it.draw_pixel_at(7, 13); it.draw_pixel_at(11, 13);
+        it.draw_pixel_at(0, 14); it.draw_pixel_at(14, 14);
+      } else if (wx == "lightning") {
+        // Lightning Variant — pixel map by Evan Cash
+        it.draw_pixel_at(8, 0); it.draw_pixel_at(9, 0); it.draw_pixel_at(10, 0); it.draw_pixel_at(11, 0); it.draw_pixel_at(12, 0);
+        it.draw_pixel_at(5, 1); it.draw_pixel_at(6, 1); it.draw_pixel_at(7, 1); it.draw_pixel_at(13, 1); it.draw_pixel_at(14, 1);
+        it.draw_pixel_at(4, 2); it.draw_pixel_at(15, 2);
+        it.draw_pixel_at(2, 3); it.draw_pixel_at(3, 3); it.draw_pixel_at(4, 3); it.draw_pixel_at(5, 3); it.draw_pixel_at(11, 3); it.draw_pixel_at(12, 3); it.draw_pixel_at(15, 3);
+        it.draw_pixel_at(1, 4); it.draw_pixel_at(5, 4); it.draw_pixel_at(6, 4); it.draw_pixel_at(10, 4); it.draw_pixel_at(12, 4); it.draw_pixel_at(16, 4);
+        it.draw_pixel_at(1, 5); it.draw_pixel_at(9, 5); it.draw_pixel_at(12, 5); it.draw_pixel_at(16, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(8, 6); it.draw_pixel_at(11, 6); it.draw_pixel_at(16, 6); it.draw_pixel_at(17, 6);
+        it.draw_pixel_at(0, 7); it.draw_pixel_at(7, 7); it.draw_pixel_at(10, 7); it.draw_pixel_at(17, 7);
+        it.draw_pixel_at(0, 8); it.draw_pixel_at(6, 8); it.draw_pixel_at(10, 8); it.draw_pixel_at(11, 8); it.draw_pixel_at(12, 8); it.draw_pixel_at(17, 8);
+        it.draw_pixel_at(0, 9); it.draw_pixel_at(1, 9); it.draw_pixel_at(5, 9); it.draw_pixel_at(6, 9); it.draw_pixel_at(7, 9); it.draw_pixel_at(8, 9); it.draw_pixel_at(12, 9); it.draw_pixel_at(13, 9); it.draw_pixel_at(17, 9);
+        it.draw_pixel_at(2, 10); it.draw_pixel_at(3, 10); it.draw_pixel_at(4, 10); it.draw_pixel_at(8, 10); it.draw_pixel_at(11, 10); it.draw_pixel_at(14, 10); it.draw_pixel_at(15, 10); it.draw_pixel_at(16, 10);
+        it.draw_pixel_at(7, 11); it.draw_pixel_at(10, 11);
+        it.draw_pixel_at(6, 12); it.draw_pixel_at(9, 12);
+        it.draw_pixel_at(5, 13); it.draw_pixel_at(8, 13);
+        it.draw_pixel_at(4, 14); it.draw_pixel_at(7, 14);
+        it.draw_pixel_at(4, 15); it.draw_pixel_at(5, 15); it.draw_pixel_at(6, 15);
+      } else if (wx == "lightning-rainy") {
+        // Lightning-Rain — pixel map by Evan Cash
+        it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0);
+        it.draw_pixel_at(5, 1); it.draw_pixel_at(9, 1);
+        it.draw_pixel_at(3, 2); it.draw_pixel_at(4, 2); it.draw_pixel_at(10, 2);
+        it.draw_pixel_at(2, 3); it.draw_pixel_at(10, 3); it.draw_pixel_at(11, 3);
+        it.draw_pixel_at(1, 4); it.draw_pixel_at(9, 4); it.draw_pixel_at(12, 4);
+        it.draw_pixel_at(0, 5); it.draw_pixel_at(13, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(13, 6);
+        it.draw_pixel_at(1, 7); it.draw_pixel_at(12, 7); it.draw_pixel_at(13, 7);
+        it.draw_pixel_at(2, 8); it.draw_pixel_at(3, 8); it.draw_pixel_at(4, 8); it.draw_pixel_at(5, 8); it.draw_pixel_at(6, 8); it.draw_pixel_at(7, 8); it.draw_pixel_at(8, 8); it.draw_pixel_at(9, 8); it.draw_pixel_at(10, 8); it.draw_pixel_at(11, 8);
+        it.draw_pixel_at(3, 10); it.draw_pixel_at(7, 10); it.draw_pixel_at(10, 10);
+        it.draw_pixel_at(6, 11);
+        it.draw_pixel_at(1, 12); it.draw_pixel_at(5, 12); it.draw_pixel_at(6, 12); it.draw_pixel_at(7, 12); it.draw_pixel_at(8, 12); it.draw_pixel_at(12, 12);
+        it.draw_pixel_at(7, 13);
+        it.draw_pixel_at(6, 14); it.draw_pixel_at(11, 14);
+        it.draw_pixel_at(3, 15);
+      } else if (wx == "fog") {
+        // Foggy — pixel map by Evan Cash
+        it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0); it.draw_pixel_at(9, 0);
+        it.draw_pixel_at(5, 1); it.draw_pixel_at(10, 1); it.draw_pixel_at(11, 1); it.draw_pixel_at(12, 1);
+        it.draw_pixel_at(3, 2); it.draw_pixel_at(4, 2); it.draw_pixel_at(13, 2);
+        it.draw_pixel_at(2, 3); it.draw_pixel_at(13, 3);
+        it.draw_pixel_at(1, 4); it.draw_pixel_at(12, 4); it.draw_pixel_at(14, 4);
+        it.draw_pixel_at(0, 5); it.draw_pixel_at(15, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(15, 6);
+        it.draw_pixel_at(1, 7); it.draw_pixel_at(4, 7); it.draw_pixel_at(5, 7); it.draw_pixel_at(6, 7); it.draw_pixel_at(7, 7); it.draw_pixel_at(9, 7); it.draw_pixel_at(10, 7); it.draw_pixel_at(11, 7); it.draw_pixel_at(12, 7); it.draw_pixel_at(15, 7);
+        it.draw_pixel_at(2, 8); it.draw_pixel_at(14, 8);
+        it.draw_pixel_at(3, 9); it.draw_pixel_at(5, 9); it.draw_pixel_at(6, 9); it.draw_pixel_at(7, 9); it.draw_pixel_at(8, 9); it.draw_pixel_at(9, 9); it.draw_pixel_at(10, 9); it.draw_pixel_at(11, 9); it.draw_pixel_at(13, 9);
+        it.draw_pixel_at(2, 11); it.draw_pixel_at(3, 11); it.draw_pixel_at(4, 11); it.draw_pixel_at(6, 11); it.draw_pixel_at(7, 11); it.draw_pixel_at(8, 11); it.draw_pixel_at(9, 11); it.draw_pixel_at(10, 11); it.draw_pixel_at(12, 11); it.draw_pixel_at(13, 11); it.draw_pixel_at(14, 11);
+        it.draw_pixel_at(3, 13); it.draw_pixel_at(4, 13); it.draw_pixel_at(5, 13); it.draw_pixel_at(6, 13); it.draw_pixel_at(8, 13); it.draw_pixel_at(10, 13); it.draw_pixel_at(11, 13); it.draw_pixel_at(12, 13); it.draw_pixel_at(13, 13);
+      } else if (wx == "exceptional") {
+        // Hazy (sun through haze) — pixel map by Evan Cash
+        it.draw_pixel_at(8, 0);
+        it.draw_pixel_at(2, 1); it.draw_pixel_at(8, 1); it.draw_pixel_at(14, 1);
+        it.draw_pixel_at(3, 2); it.draw_pixel_at(13, 2);
+        it.draw_pixel_at(7, 3); it.draw_pixel_at(8, 3); it.draw_pixel_at(9, 3);
+        it.draw_pixel_at(5, 4); it.draw_pixel_at(6, 4); it.draw_pixel_at(10, 4); it.draw_pixel_at(11, 4);
+        it.draw_pixel_at(5, 5); it.draw_pixel_at(11, 5);
+        it.draw_pixel_at(4, 6); it.draw_pixel_at(12, 6);
+        it.draw_pixel_at(1, 7); it.draw_pixel_at(2, 7); it.draw_pixel_at(4, 7); it.draw_pixel_at(12, 7); it.draw_pixel_at(14, 7); it.draw_pixel_at(15, 7);
+        it.draw_pixel_at(4, 8); it.draw_pixel_at(12, 8);
+        it.draw_pixel_at(2, 9); it.draw_pixel_at(3, 9); it.draw_pixel_at(4, 9); it.draw_pixel_at(5, 9); it.draw_pixel_at(7, 9); it.draw_pixel_at(8, 9); it.draw_pixel_at(9, 9); it.draw_pixel_at(11, 9); it.draw_pixel_at(12, 9); it.draw_pixel_at(13, 9); it.draw_pixel_at(14, 9);
+        it.draw_pixel_at(0, 11); it.draw_pixel_at(1, 11); it.draw_pixel_at(2, 11); it.draw_pixel_at(3, 11); it.draw_pixel_at(6, 11); it.draw_pixel_at(7, 11); it.draw_pixel_at(8, 11); it.draw_pixel_at(9, 11); it.draw_pixel_at(10, 11); it.draw_pixel_at(13, 11); it.draw_pixel_at(14, 11); it.draw_pixel_at(15, 11); it.draw_pixel_at(16, 11);
+        it.draw_pixel_at(1, 13); it.draw_pixel_at(2, 13); it.draw_pixel_at(3, 13); it.draw_pixel_at(4, 13); it.draw_pixel_at(5, 13); it.draw_pixel_at(6, 13); it.draw_pixel_at(9, 13); it.draw_pixel_at(10, 13); it.draw_pixel_at(11, 13); it.draw_pixel_at(12, 13); it.draw_pixel_at(13, 13); it.draw_pixel_at(14, 13);
+      } else if (wx == "windy") {
+        // Windy — pixel map by Evan Cash
+        it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0);
+        it.draw_pixel_at(5, 1); it.draw_pixel_at(8, 1);
+        it.draw_pixel_at(7, 2);
+        it.draw_pixel_at(0, 3); it.draw_pixel_at(1, 3); it.draw_pixel_at(2, 3); it.draw_pixel_at(3, 3); it.draw_pixel_at(4, 3); it.draw_pixel_at(5, 3); it.draw_pixel_at(6, 3); it.draw_pixel_at(11, 3); it.draw_pixel_at(12, 3);
+        it.draw_pixel_at(10, 4); it.draw_pixel_at(13, 4);
+        it.draw_pixel_at(12, 5);
+        it.draw_pixel_at(5, 6); it.draw_pixel_at(6, 6); it.draw_pixel_at(7, 6); it.draw_pixel_at(8, 6); it.draw_pixel_at(9, 6); it.draw_pixel_at(10, 6); it.draw_pixel_at(11, 6);
+        it.draw_pixel_at(1, 9); it.draw_pixel_at(2, 9); it.draw_pixel_at(3, 9); it.draw_pixel_at(4, 9); it.draw_pixel_at(5, 9); it.draw_pixel_at(6, 9); it.draw_pixel_at(7, 9); it.draw_pixel_at(8, 9);
+        it.draw_pixel_at(9, 10);
+        it.draw_pixel_at(7, 11); it.draw_pixel_at(10, 11);
+        it.draw_pixel_at(8, 12); it.draw_pixel_at(9, 12);
+      } else if (wx == "windy-variant") {
+        // Windy Cloudy — pixel map by Evan Cash
+        it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0);
+        it.draw_pixel_at(5, 1); it.draw_pixel_at(9, 1); it.draw_pixel_at(10, 1); it.draw_pixel_at(11, 1);
+        it.draw_pixel_at(3, 2); it.draw_pixel_at(4, 2); it.draw_pixel_at(12, 2);
+        it.draw_pixel_at(2, 3); it.draw_pixel_at(12, 3);
+        it.draw_pixel_at(1, 4); it.draw_pixel_at(11, 4); it.draw_pixel_at(13, 4);
+        it.draw_pixel_at(0, 5); it.draw_pixel_at(10, 5); it.draw_pixel_at(14, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(14, 6);
+        it.draw_pixel_at(1, 7); it.draw_pixel_at(14, 7);
+        it.draw_pixel_at(2, 8); it.draw_pixel_at(13, 8);
+        it.draw_pixel_at(3, 9); it.draw_pixel_at(4, 9); it.draw_pixel_at(5, 9); it.draw_pixel_at(6, 9); it.draw_pixel_at(7, 9); it.draw_pixel_at(8, 9); it.draw_pixel_at(9, 9); it.draw_pixel_at(10, 9); it.draw_pixel_at(11, 9); it.draw_pixel_at(12, 9);
+        it.draw_pixel_at(3, 11); it.draw_pixel_at(4, 11); it.draw_pixel_at(5, 11); it.draw_pixel_at(6, 11); it.draw_pixel_at(7, 11); it.draw_pixel_at(8, 11); it.draw_pixel_at(9, 11); it.draw_pixel_at(10, 11); it.draw_pixel_at(11, 11);
+        it.draw_pixel_at(12, 12);
+        it.draw_pixel_at(10, 13); it.draw_pixel_at(13, 13);
+        it.draw_pixel_at(9, 14); it.draw_pixel_at(13, 14);
+        it.draw_pixel_at(10, 15); it.draw_pixel_at(11, 15); it.draw_pixel_at(12, 15);
+      } else if (wx == "unavailable" || wx == "unknown" || wx == "") {
+        // Met.no unavailable — show --
+        it.print(2, 4, id(font_medium), "--");
+      } else {
+        // Default fallback — Cloudy sprite
+        it.draw_pixel_at(6, 0); it.draw_pixel_at(7, 0); it.draw_pixel_at(8, 0); it.draw_pixel_at(9, 0); it.draw_pixel_at(10, 0);
+        it.draw_pixel_at(4, 1); it.draw_pixel_at(5, 1); it.draw_pixel_at(11, 1);
+        it.draw_pixel_at(3, 2); it.draw_pixel_at(12, 2);
+        it.draw_pixel_at(2, 3); it.draw_pixel_at(12, 3); it.draw_pixel_at(13, 3); it.draw_pixel_at(14, 3); it.draw_pixel_at(15, 3);
+        it.draw_pixel_at(2, 4); it.draw_pixel_at(11, 4); it.draw_pixel_at(12, 4); it.draw_pixel_at(16, 4);
+        it.draw_pixel_at(1, 5); it.draw_pixel_at(2, 5); it.draw_pixel_at(11, 5); it.draw_pixel_at(17, 5);
+        it.draw_pixel_at(0, 6); it.draw_pixel_at(3, 6); it.draw_pixel_at(10, 6); it.draw_pixel_at(18, 6);
+        it.draw_pixel_at(0, 7); it.draw_pixel_at(18, 7);
+        it.draw_pixel_at(0, 8); it.draw_pixel_at(17, 8);
+        it.draw_pixel_at(1, 9); it.draw_pixel_at(16, 9);
+        it.draw_pixel_at(1, 10); it.draw_pixel_at(16, 10);
+        it.draw_pixel_at(2, 11); it.draw_pixel_at(3, 11); it.draw_pixel_at(14, 11); it.draw_pixel_at(15, 11);
+        it.draw_pixel_at(4, 12); it.draw_pixel_at(5, 12); it.draw_pixel_at(6, 12); it.draw_pixel_at(7, 12); it.draw_pixel_at(8, 12); it.draw_pixel_at(9, 12); it.draw_pixel_at(10, 12); it.draw_pixel_at(11, 12); it.draw_pixel_at(12, 12); it.draw_pixel_at(13, 12);
+      }
+
+      // ── LEFT COLUMN ──────────────────────────────────────────
+      it.printf(2, 21, id(font_medium), "%d", outside);
+      { int dotx = (outside >= 100) ? 23 : 17;
+        it.draw_pixel_at(dotx,   21); it.draw_pixel_at(dotx+1, 21);
+        it.draw_pixel_at(dotx,   22); it.draw_pixel_at(dotx+1, 22); }
+
+      it.print(2, 44, id(font_label), "DEW");
+
+      it.printf(2, 55, id(font_medium), "%d", dewpt);
+      { int dotx = (dewpt >= 100) ? 23 : 17;
+        it.draw_pixel_at(dotx,   55); it.draw_pixel_at(dotx+1, 55);
+        it.draw_pixel_at(dotx,   56); it.draw_pixel_at(dotx+1, 56); }
+
+      // ── CENTER COLUMN ─────────────────────────────────────────
+      if (adjusting) {
+        it.printf(64, 6, id(font_large), TextAlign::TOP_CENTER, "%d", target);
+        if (id(dim_level) > 0) it.printf(65, 6, id(font_large), TextAlign::TOP_CENTER, "%d", target);
+      } else if (indoor_valid) {
+        it.printf(64, 6, id(font_large), TextAlign::TOP_CENTER, "%d", indoor_f);
+        if (id(dim_level) > 0) it.printf(65, 6, id(font_large), TextAlign::TOP_CENTER, "%d", indoor_f);
+      } else {
+        it.print(64, 6, id(font_large), TextAlign::TOP_CENTER, "--");
+      }
+
+      // Bottom label — blink "SET TEMP" during adjustment
+      const char* modeStr = (mode == 0) ? "HEAT" :
+                            (mode == 1) ? "COOL" : "OFF";
+      if (adjusting) {
+        it.print(64, 55, id(font_label), TextAlign::TOP_CENTER, "SET TEMP");
+      } else {
+        it.print(64, 55, id(font_label), TextAlign::TOP_CENTER, modeStr);
+      }
+
+      // ── RIGHT COLUMN ─────────────────────────────────────────
+      if (adjusting) {
+        // During adjustment — show actual temp in upper right
+        it.print(123, 2,  id(font_label), TextAlign::TOP_RIGHT, "ACT");
+        it.print(127, 10, id(font_label), TextAlign::TOP_RIGHT, "TEMP");
+        if (indoor_valid) {
+          it.printf(124, 21, id(font_medium), TextAlign::TOP_RIGHT, "%d", indoor_f);
+          it.draw_pixel_at(126, 21); it.draw_pixel_at(127, 21);
+          it.draw_pixel_at(126, 22); it.draw_pixel_at(127, 22);
+        } else {
+          it.print(124, 21, id(font_medium), TextAlign::TOP_RIGHT, "--");
+        }
+      } else {
+        // Normal — show set temp in upper right
+        it.print(123, 2,  id(font_label), TextAlign::TOP_RIGHT, "SET");
+        it.print(127, 10, id(font_label), TextAlign::TOP_RIGHT, "TEMP");
+        it.printf(124, 21, id(font_medium), TextAlign::TOP_RIGHT, "%d", target);
+        it.draw_pixel_at(126, 21); it.draw_pixel_at(127, 21);
+        it.draw_pixel_at(126, 22); it.draw_pixel_at(127, 22);
+      }
+      it.print(125, 44, id(font_label), TextAlign::TOP_RIGHT, "HUM");
+      it.printf(127, 55, id(font_medium), TextAlign::TOP_RIGHT, "%d%%", humid);
+
+# ── THERMOSTAT LOGIC ───────────────────────────────────────────
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (isnan(id(indoor_temp).state)) return;
+          float temp_f = (id(indoor_temp).state * 9.0 / 5.0) + 32.0;
+          float setpt  = id(setpoint_f);
+          int   mode   = id(hvac_mode);
+          float deadband = 1.0;
+          if (mode == 0) {
+            if (temp_f < setpt - deadband) id(fcu_relay).turn_on();
+            if (temp_f > setpt + deadband) id(fcu_relay).turn_off();
+          } else if (mode == 1) {
+            if (temp_f > setpt + deadband) id(fcu_relay).turn_on();
+            if (temp_f < setpt - deadband) id(fcu_relay).turn_off();
+          } else {
+            id(fcu_relay).turn_off();
+          }
+
+# ── HA CONTROLS (setpoint + mode) ─────────────────────────────
+number:
+  - platform: template
+    name: "Set Temperature"
+    id: ha_setpoint
+    min_value: 60
+    max_value: 85
+    step: 1
+    unit_of_measurement: "°F"
+    icon: "mdi:thermometer"
+    lambda: |-
+      return id(setpoint_f);
+    set_action:
+      - lambda: |-
+          id(setpoint_f) = x;
+          id(last_encoder_val) = x;
+          id(last_adjust_ms) = millis();
+      - sensor.rotary_encoder.set_value:
+          id: setpoint_encoder
+          value: !lambda return x;
+      - lambda: |-
+          if (!isnan(id(indoor_temp).state)) {
+            float temp_f = (id(indoor_temp).state * 9.0 / 5.0) + 32.0;
+            float setpt  = id(setpoint_f);
+            int   mode   = id(hvac_mode);
+            float deadband = 1.0;
+            if (mode == 0) {
+              if (temp_f < setpt - deadband) id(fcu_relay).turn_on();
+              if (temp_f > setpt + deadband) id(fcu_relay).turn_off();
+            } else if (mode == 1) {
+              if (temp_f > setpt + deadband) id(fcu_relay).turn_on();
+              if (temp_f < setpt - deadband) id(fcu_relay).turn_off();
+            } else {
+              id(fcu_relay).turn_off();
+            }
+          }
+
+select:
+  - platform: template
+    name: "HVAC Mode"
+    id: ha_mode
+    icon: "mdi:thermostat"
+    options:
+      - "Heat"
+      - "Cool"
+      - "Off"
+    lambda: |-
+      if (id(hvac_mode) == 0) return std::string("Heat");
+      if (id(hvac_mode) == 1) return std::string("Cool");
+      return std::string("Off");
+    set_action:
+      - lambda: |-
+          if (x == "Heat") id(hvac_mode) = 0;
+          else if (x == "Cool") id(hvac_mode) = 1;
+          else id(hvac_mode) = 2;
+          if (!isnan(id(indoor_temp).state)) {
+            float temp_f = (id(indoor_temp).state * 9.0 / 5.0) + 32.0;
+            float setpt  = id(setpoint_f);
+            int   mode   = id(hvac_mode);
+            float deadband = 1.0;
+            if (mode == 0) {
+              if (temp_f < setpt - deadband) id(fcu_relay).turn_on();
+              if (temp_f > setpt + deadband) id(fcu_relay).turn_off();
+            } else if (mode == 1) {
+              if (temp_f > setpt + deadband) id(fcu_relay).turn_on();
+              if (temp_f < setpt - deadband) id(fcu_relay).turn_off();
+            } else {
+              id(fcu_relay).turn_off();
+            }
+          }
+
+# ── CLIMATE ENTITY (HomeKit wrapper — ESP32 stays in control) ───
+climate:
+  - platform: thermostat
+    name: "Thermostat"
+    sensor: indoor_temp
+    min_heating_off_time: 0s
+    min_heating_run_time: 0s
+    min_cooling_off_time: 0s
+    min_cooling_run_time: 0s
+    min_idle_time: 0s
+    heat_action:
+      - lambda: |-
+          id(hvac_mode) = 0;
+          id(last_adjust_ms) = millis();
+    cool_action:
+      - lambda: |-
+          id(hvac_mode) = 1;
+          id(last_adjust_ms) = millis();
+    idle_action:
+      - lambda: |-
+          id(last_adjust_ms) = millis();
+    on_control:
+      - lambda: |-
+          auto t = x.get_target_temperature_low();
+          if (t.has_value()) {
+            id(setpoint_f) = (t.value() * 9.0 / 5.0) + 32.0;
+            id(last_encoder_val) = id(setpoint_f);
+            id(last_adjust_ms) = millis();
+          }
+      - sensor.rotary_encoder.set_value:
+          id: setpoint_encoder
+          value: !lambda return id(setpoint_f);
+    preset:
+      - name: Home
+        default_target_temperature_low: 22.2
+        default_target_temperature_high: 22.2
+    heat_deadband: 0.5
+    cool_deadband: 0.5
+    visual:
+      min_temperature: 15.5
+      max_temperature: 29.4
+      temperature_step: 0.5
