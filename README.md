@@ -53,16 +53,6 @@ I have a seasonal 2-pipe 120V fan coil system and wanted something smarter than 
 ## Internal Component Layout
 ![Internal layout](thermostat-premounting_layout.jpg)
 (Esp32 and the mounting extender were rotated left 90° in final layout)
-## Display Features
-
-- Custom OLED UI
-- Ambient dimming
-- Multi-screen rotary menu
-- Hand-crafted pixel weather sprites
-
-Complete wiring documentation:
-- [PDF schematic](./thermostat-wiring-schematic.pdf)
-- [SVG schematic](./thermostat-wiring-schematic.svg)
 
 Includes:
 - 120V-AC 5V-DC fan coil relay switching
@@ -70,6 +60,22 @@ Includes:
 - ESP32-S3 pin mapping
 - Sensor and OLED connections
 - Terminal distribution layout reservations
+
+## Display Features
+- Custom OLED UI
+- Ambient dimming
+- Multi-screen rotary menu
+- Hand-crafted pixel weather sprites
+
+## Design Documentation
+
+### Wiring Schematic
+- [PDF schematic](./thermostat-wiring-schematic.pdf)
+- [SVG schematic](./thermostat-wiring-schematic.svg)
+
+### Internal Component Layout
+![Internal layout diagram](thermostat-internal-diagram.png)
+
 
 ## Architecture
 
